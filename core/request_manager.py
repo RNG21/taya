@@ -1,26 +1,32 @@
 import asyncio
 import random
-from typing import Any, Dict, Literal
-from asyncio import PriorityQueue
+from typing import Any, Dict, Literal, Union, Coroutine, Iterable, List
+from asyncio import PriorityQueue, Task
 
 import aiohttp
 from aiohttp import ClientSession, ClientResponse
 
 
+class NoJson(Exception):
+    """Raised when response is not json"""
+
 class Response(ClientResponse):
     """for type hinting"""
-    text: str
-    content: str
+    text: Union[str, Coroutine]
     json: Any
+
+    def check_nojson(self):
+        if self.json is None:
+            raise NoJson
+        return self.json
 
 
 async def to_response(response: ClientResponse) -> Response:
     """Make attributes accessible after connection closed"""
-    response.text = await response.text()
-    response.content = await response.content.read()
     if "json" in response.content_type:
         response.json = await response.json()
     else:
+        response.text = await response.text()
         response.json = None
     response.__class__ = Response
 
@@ -28,41 +34,51 @@ async def to_response(response: ClientResponse) -> Response:
 
 
 class RequestJob:
-    def __init__(self, *, priority: int, id_: int, kwargs: dict, retries: int = 0):
+    def __init__(self, *, priority: int, entry: int, id_: int, kwargs: dict, retries: int = 0):
         """
 
         Args:
             priority: priority of the job
+            entry: entry count of job, to maintain insertion order in heap
             id_: unique id of the job
             retries: how many retries this job is allowed
             kwargs: kwargs for aiohttp.ClientSession.send
         """
         self.priority = priority
+        self.entry = entry
         self.id = id_
         self.retries = retries
         self.kwargs = kwargs
 
-    def _check(self, other, operator: Literal["<", "<=", ">", ">="]):
+    def _compare(self, other, operator: Literal["<", "<=", ">", ">="]):
         if not isinstance(other, RequestJob):
             return NotImplemented
-        return {
-            "<": self.priority < other.priority,
-            "<=": self.priority <= other.priority,
-            ">": self.priority > other.priority,
-            ">=": self.priority >= other.priority
-        }[operator]
+
+        def cases(attr_name: Literal["priority", "entry"]):
+            compare_self = getattr(self, attr_name)
+            compare_other = getattr(other, attr_name)
+            return {
+                "<": compare_self < compare_other,
+                "<=": compare_self <= compare_other,
+                ">": compare_self > compare_other,
+                ">=": compare_self >= compare_other
+            }[operator]
+
+        if self.priority == other.priority:
+            return cases("entry")
+        return cases("priority")
 
     def __lt__(self, other):
-        return self._check(other, "<")
+        return self._compare(other, "<")
 
     def __le__(self, other):
-        return self._check(other, "<=")
+        return self._compare(other, "<=")
 
     def __gt__(self, other):
-        return self._check(other, ">")
+        return self._compare(other, ">")
 
     def __ge__(self, other):
-        return self._check(other, ">=")
+        return self._compare(other, ">=")
 
 
 class RequestManager:
@@ -86,15 +102,16 @@ class RequestManager:
         self.queue = asyncio.PriorityQueue()
         self.results = {}  # {job_id: response}
 
+        self.entry_order = 0
         self.ids = set()
         self.close = False
         self.started = False
 
     async def start_async_tasks(self):
         assert not self.started
+        self.started = True
         asyncio.create_task(self._restore())
         asyncio.create_task(self._execute_jobs())
-        self.started = True
 
     async def _restore(self):
         """Restores available requests"""
@@ -155,13 +172,15 @@ class RequestManager:
 
         return response
 
-    async def send(self, *, priority: int = 1, retries: int, kwargs: dict) -> Response:
+    async def _send(self, *, priority: int, retries: int, kwargs: dict) -> Response:
         if not self.started:
             await self.start_async_tasks()
 
         # Put job into queue
+        self.entry_order += 1
         job = RequestJob(
             priority=priority,
+            entry=self.entry_order,
             id_=self._random_id(),
             retries=retries,
             kwargs=kwargs
@@ -170,21 +189,26 @@ class RequestManager:
 
         return await self.retrieve_job(job.id)
 
-    async def get(self, *, url: str, priority: int = 1, retries: int = 0) -> Response:
-        return await self.send(priority=priority, retries=retries, kwargs={"method": "get", "url": url})
+    def send(self, *, priority: int = 1, retries: int, kwargs: dict) -> Task[Response]:
+        return asyncio.create_task(self._send(priority=priority, retries=retries, kwargs=kwargs))
+
+    def get(self, url: str, *, priority: int = 1, retries: int = 0) -> Task[Response]:
+        return asyncio.create_task(
+            self._send(priority=priority, retries=retries, kwargs={"method": "GET", "url": url})
+        )
 
 
 if __name__ == "__main__":
     async def main():
         async with aiohttp.ClientSession() as session:
             client = RequestManager(session=session, rps=3, burst=10)
-            for i in range(5):
-                for _ in range(10):
-                    asyncio.create_task(client.get(
-                        url="https://api.warframe.market/v1/items/secura_dual_cestra",
-                        priority=i,
-                        retries=1
-                    ))
+            for i in range(1000):
+                client.get(
+                    url=f"https://api.warframe.market/v1/items",
+                    priority=i,
+                    retries=1
+                )
+            await asyncio.sleep(1)
             while True:
                 await asyncio.sleep(60)
 
